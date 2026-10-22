@@ -1,7 +1,5 @@
 """
-NSE Stock Analysis API (v2: signals, market overview, news, compare, backtesting)
---------------------------------------------------------------------------------
-Original description: NSE Stock Analysis API — for n8n integration
+NSE Stock Analysis API — for n8n integration
 ================================================================================
 A single FastAPI service that does ALL the real work (data pull + every
 indicator built in our Jupyter session) and exposes it as one clean HTTP
@@ -273,58 +271,6 @@ def get_technical_snapshot(hist):
     return technical, corporate_action_flag
 
 
-# ── SIGNAL LABELS (used for colour-coded badges + heatmap) ──────────────────
-
-def build_signals(technical):
-    """Turn raw indicator values into simple labels the frontend can colour-code."""
-    rsi = technical.get("rsi_14")
-    hist_val = technical.get("macd_histogram")
-    ma_trend = technical.get("ma_trend")
-    pct52 = technical.get("pct_of_52w_high")
-
-    if rsi is None:
-        rsi_signal = None
-    elif rsi > 70:
-        rsi_signal = "Overbought"
-    elif rsi < 30:
-        rsi_signal = "Oversold"
-    else:
-        rsi_signal = "Neutral"
-
-    if hist_val is None:
-        macd_tag = None
-    else:
-        macd_tag = "Bullish" if hist_val > 0 else "Bearish"
-
-    # Heatmap score: each of 4 components contributes -1, 0 or +1  ->  scaled to -100..+100
-    score = 0
-    if ma_trend == "bullish": score += 1
-    elif ma_trend == "bearish": score -= 1
-    if macd_tag == "Bullish": score += 1
-    elif macd_tag == "Bearish": score -= 1
-    if rsi is not None:
-        if rsi >= 55: score += 1
-        elif rsi <= 45: score -= 1
-    if pct52 is not None:
-        if pct52 >= 90: score += 1
-        elif pct52 < 70: score -= 1
-    score_pct = score * 25
-
-    if score_pct >= 50: label = "Strong Bullish"
-    elif score_pct > 0: label = "Bullish"
-    elif score_pct == 0: label = "Neutral"
-    elif score_pct > -50: label = "Bearish"
-    else: label = "Strong Bearish"
-
-    return {
-        "rsi_signal": rsi_signal,        # Overbought (red) / Oversold (green) / Neutral
-        "macd_signal": macd_tag,         # Bullish / Bearish
-        "ma_signal": ma_trend.capitalize() if ma_trend else None,
-        "signal_score": score_pct,       # -100 (very bearish) .. +100 (very bullish)
-        "signal_label": label,
-    }
-
-
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "NSE Stock Analysis API is running"}
@@ -357,7 +303,6 @@ def analyze_stock(symbol: str):
                 if corporate_action_flag else None
             ),
             "technical": technical,
-            "signals": build_signals(technical),
             "fundamentals": fundamentals,
         }
 
@@ -447,7 +392,6 @@ def watchlist(symbols: str):
                 "ma_trend": technical["ma_trend"],
                 "pct_of_52w_high": technical["pct_of_52w_high"],
                 "corporate_action_flag": corporate_action_flag,
-                **build_signals(technical),
             })
         except Exception as e:
             results.append({"symbol": ticker, "error": str(e)})
@@ -455,343 +399,299 @@ def watchlist(symbols: str):
     return {"count": len(results), "stocks": results}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  NEW IN v2:  /market-overview   /news   /compare   /backtest   /backtest-all
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  NEW FEATURES (v2):  /market  ·  /news/{symbol}  ·  /backtest/{symbol}
+#  Uses only the packages already in requirements.txt (no new installs).
+# ══════════════════════════════════════════════════════════════════════════
+import time
 
-def to_ticker(symbol: str) -> str:
-    symbol = symbol.upper().strip()
-    return symbol if symbol.endswith(".NS") else f"{symbol}.NS"
+# Small in-memory cache so repeated clicks don't hammer Yahoo Finance
+# (keeps the free Render tier fast and avoids rate-limits).
+_CACHE = {}
+
+def cached(key, ttl_seconds, fn):
+    now = time.time()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl_seconds:
+        return hit[1]
+    value = fn()
+    _CACHE[key] = (now, value)
+    return value
 
 
-# ── 1. MARKET OVERVIEW (NIFTY 50 / SENSEX / BANK NIFTY) ─────────────────────
+# ── 1. MARKET OVERVIEW (NIFTY 50 / SENSEX / BANK NIFTY) ───────────────────
 
-INDEX_MAP = [
-    ("NIFTY 50", "^NSEI"),
-    ("SENSEX", "^BSESN"),
-    ("BANK NIFTY", "^NSEBANK"),
-]
+INDICES = [("NIFTY 50", "^NSEI"), ("SENSEX", "^BSESN"), ("BANK NIFTY", "^NSEBANK")]
 
-@app.get("/market-overview")
-def market_overview():
-    """Index level, daily change and a 1-month sparkline for the top-of-page ticker bar."""
-    indices = []
-    for name, ticker in INDEX_MAP:
+def _fetch_market():
+    out = []
+    for name, tkr in INDICES:
         try:
-            h = yf.Ticker(ticker).history(period="1mo", auto_adjust=False)
-            closes = h["Close"].dropna()
-            if len(closes) < 2:
-                indices.append({"name": name, "symbol": ticker, "error": "No data"})
+            h = yf.Ticker(tkr).history(period="10d").dropna(subset=["Close"])
+            if len(h) < 2:
+                out.append({"name": name, "symbol": tkr, "error": "No data"})
                 continue
-            last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
-            indices.append({
+            last = float(h["Close"].iloc[-1])
+            prev = float(h["Close"].iloc[-2])
+            out.append({
                 "name": name,
-                "symbol": ticker,
-                "level": safe_round(last),
-                "change": safe_round(last - prev),
-                "change_pct": safe_round((last / prev - 1) * 100),
-                "as_of": closes.index[-1].strftime("%Y-%m-%d"),
-                "sparkline": [safe_round(v) for v in closes.tolist()],
+                "symbol": tkr,
+                "level": round(last, 2),
+                "change": round(last - prev, 2),
+                "change_pct": round((last / prev - 1) * 100, 2),
+                "as_of": h.index[-1].strftime("%Y-%m-%d"),
             })
         except Exception as e:
-            indices.append({"name": name, "symbol": ticker, "error": str(e)})
-    return {"timestamp": datetime.now().isoformat(), "indices": indices}
+            out.append({"name": name, "symbol": tkr, "error": str(e)})
+    return {"indices": out, "timestamp": datetime.now().isoformat()}
 
 
-# ── 2. NEWS HEADLINES ───────────────────────────────────────────────────────
-
-@app.get("/news/{symbol}")
-def stock_news(symbol: str, limit: int = 10):
-    """Latest headlines via yfinance. Handles both old and new yfinance news formats."""
-    ticker = to_ticker(symbol)
-    limit = min(max(limit, 1), 20)
-    try:
-        raw = yf.Ticker(ticker).news or []
-    except Exception as e:
-        return {"symbol": ticker, "count": 0, "news": [], "note": f"News unavailable: {e}"}
-
-    items = []
-    for n in raw[:limit]:
-        try:
-            if isinstance(n, dict) and "content" in n and isinstance(n["content"], dict):   # newer yfinance
-                c = n["content"]
-                url = (c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
-                items.append({
-                    "title": c.get("title"),
-                    "summary": c.get("summary"),
-                    "publisher": (c.get("provider") or {}).get("displayName"),
-                    "published": c.get("pubDate"),
-                    "url": url,
-                })
-            else:                                                                              # older yfinance
-                ts = n.get("providerPublishTime")
-                items.append({
-                    "title": n.get("title"),
-                    "summary": None,
-                    "publisher": n.get("publisher"),
-                    "published": datetime.fromtimestamp(ts).isoformat() if ts else None,
-                    "url": n.get("link"),
-                })
-        except Exception:
-            continue
-    items = [i for i in items if i.get("title")]
-    return {"symbol": ticker, "count": len(items), "news": items}
+@app.get("/market")
+def market_overview():
+    """Index level + daily change for NIFTY 50, SENSEX and BANK NIFTY (cached 2 min)."""
+    return cached("market", 120, _fetch_market)
 
 
-# ── 3. COMPARE 2-3 STOCKS (normalised to 100) ───────────────────────────────
+# ── 2. NEWS HEADLINES ──────────────────────────────────────────────────────
 
-@app.get("/compare")
-def compare(symbols: str, months: int = 6):
-    """
-    Rebased performance: every stock starts at 100 on the first day of the window.
-    Example: /compare?symbols=RELIANCE,TCS,INFY&months=6
-    """
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:3]
-    if len(symbol_list) < 2:
-        raise HTTPException(status_code=400, detail="Provide 2 or 3 symbols, e.g. ?symbols=RELIANCE,TCS")
-    months = min(max(months, 1), 24)
-
-    series, summary, errors = {}, [], []
-    for sym in symbol_list:
-        ticker = to_ticker(sym)
-        try:
-            hist = yf.Ticker(ticker).history(period="2y", auto_adjust=True)
-            if hist.empty:
-                errors.append({"symbol": sym, "error": "No data found"})
-                continue
-            close = hist["Close"].dropna()
-            close.index = close.index.tz_localize(None).normalize()
-            cutoff = close.index[-1] - pd.DateOffset(months=months)
-            close = close[close.index >= cutoff]
-            series[sym.replace(".NS", "")] = close / close.iloc[0] * 100
-            rets = close.pct_change().dropna()
-            summary.append({
-                "symbol": sym.replace(".NS", ""),
-                "start_price": safe_round(close.iloc[0]),
-                "end_price": safe_round(close.iloc[-1]),
-                "total_return_pct": safe_round((close.iloc[-1] / close.iloc[0] - 1) * 100),
-                "annualised_volatility_pct": safe_round(rets.std() * np.sqrt(252) * 100),
-            })
-        except Exception as e:
-            errors.append({"symbol": sym, "error": str(e)})
-
-    if len(series) < 2:
-        raise HTTPException(status_code=404, detail=f"Could not load at least 2 stocks. Details: {errors}")
-
-    df = pd.DataFrame(series).sort_index().ffill().dropna()
-    rows = []
-    for date, r in df.iterrows():
-        row = {"date": date.strftime("%Y-%m-%d")}
-        for col in df.columns:
-            row[col] = safe_round(r[col])
-        rows.append(row)
-    return {"symbols": list(df.columns), "months": months, "data": rows, "summary": summary, "errors": errors}
-
-
-# ── 4. BACKTESTING ENGINE ───────────────────────────────────────────────────
-
-STRATEGIES = {
-    "buy_and_hold": "Buy on day 1 and hold. The benchmark every strategy must beat.",
-    "ma_crossover": "Long when the fast MA is above the slow MA (default 50/200 'golden cross'); cash otherwise.",
-    "rsi_mean_reversion": "Buy when RSI falls below the buy level (default 30); sell when it rises above the sell level (default 70).",
-    "macd_crossover": "Long while the MACD line is above its signal line; cash otherwise.",
-    "bollinger_reversion": "Buy when price closes below the lower Bollinger Band; sell when it recovers to the middle band.",
-}
-
-@app.get("/backtest-strategies")
-def backtest_strategies():
-    return {"strategies": [{"id": k, "description": v} for k, v in STRATEGIES.items()]}
-
-
-def _build_positions(strategy, close, fast, slow, rsi_period, rsi_buy, rsi_sell):
-    """Returns a 0/1 series: 1 = holding the stock at the close of that day, 0 = in cash."""
-    if strategy == "buy_and_hold":
-        return pd.Series(1, index=close.index)
-
-    if strategy == "ma_crossover":
-        return (close.rolling(fast).mean() > close.rolling(slow).mean()).astype(int)
-
-    if strategy == "macd_crossover":
-        line, sig, _ = calculate_macd(close)
-        return (line > sig).astype(int)
-
-    if strategy == "rsi_mean_reversion":
-        rsi = calculate_rsi(close, rsi_period).values
-        out, state = [], 0
-        for v in rsi:
-            if not np.isnan(v):
-                if state == 0 and v < rsi_buy:
-                    state = 1
-                elif state == 1 and v > rsi_sell:
-                    state = 0
-            out.append(state)
-        return pd.Series(out, index=close.index)
-
-    if strategy == "bollinger_reversion":
-        mid = close.rolling(20).mean()
-        lower = mid - 2 * close.rolling(20).std()
-        out, state = [], 0
-        for c, m, l in zip(close.values, mid.values, lower.values):
-            if not (np.isnan(m) or np.isnan(l)):
-                if state == 0 and c < l:
-                    state = 1
-                elif state == 1 and c > m:
-                    state = 0
-            out.append(state)
-        return pd.Series(out, index=close.index)
-
-    raise HTTPException(status_code=400, detail=f"Unknown strategy. Choose from: {list(STRATEGIES)}")
-
-
-def _metrics_from_returns(rets, equity, capital, dates):
-    years = max((dates[-1] - dates[0]).days / 365.25, 1e-9)
-    final = float(equity.iloc[-1])
-    vol = float(rets.std() * np.sqrt(252)) if len(rets) > 1 else 0.0
-    cagr = (final / capital) ** (1 / years) - 1 if final > 0 else -1.0
-    sharpe = ((rets.mean() * 252 - 0.06) / vol) if vol > 0 else None      # 6% approx. Indian risk-free rate
-    max_dd = float((equity / equity.cummax() - 1).min())
+def _parse_news_item(item):
+    """yfinance changed its news format; this handles both the new and old layouts."""
+    content = item.get("content") if isinstance(item, dict) else None
+    if content:
+        url = ((content.get("canonicalUrl") or {}).get("url")
+               or (content.get("clickThroughUrl") or {}).get("url"))
+        return {
+            "title": content.get("title"),
+            "publisher": (content.get("provider") or {}).get("displayName"),
+            "published": content.get("pubDate"),
+            "url": url,
+            "summary": content.get("summary"),
+        }
+    ts = item.get("providerPublishTime")
     return {
-        "final_value": safe_round(final),
-        "total_return_pct": safe_round((final / capital - 1) * 100),
-        "cagr_pct": safe_round(cagr * 100),
-        "annualised_volatility_pct": safe_round(vol * 100),
-        "sharpe_ratio": safe_round(sharpe) if sharpe is not None else None,
-        "max_drawdown_pct": safe_round(max_dd * 100),
+        "title": item.get("title"),
+        "publisher": item.get("publisher"),
+        "published": datetime.fromtimestamp(ts).isoformat() if ts else None,
+        "url": item.get("link"),
+        "summary": None,
     }
 
 
-def _run_backtest(hist, strategy, months, fast, slow, rsi_period, rsi_buy, rsi_sell, cost_pct, capital):
-    close_full = hist["Close"].dropna().copy()
-    close_full.index = close_full.index.tz_localize(None).normalize()
+@app.get("/news/{symbol}")
+def stock_news(symbol: str):
+    """Latest headlines for one stock (max 10, cached 5 min)."""
+    symbol = symbol.upper().strip()
+    ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
 
-    positions_full = _build_positions(strategy, close_full, fast, slow, rsi_period, rsi_buy, rsi_sell)
+    def fetch():
+        try:
+            raw = yf.Ticker(ticker).news or []
+        except Exception as e:
+            return {"symbol": ticker, "count": 0, "news": [],
+                    "note": f"News temporarily unavailable: {e}"}
+        items = [_parse_news_item(i) for i in raw]
+        items = [i for i in items if i.get("title")][:10]
+        return {"symbol": ticker, "count": len(items), "news": items,
+                "note": None if items else "No recent headlines found for this stock."}
 
-    cutoff = close_full.index[-1] - pd.DateOffset(months=months)
-    mask = close_full.index >= cutoff
-    close = close_full[mask]
-    pos = positions_full[mask]
+    return cached(f"news:{ticker}", 300, fetch)
+
+
+# ── 3. BACKTESTING ENGINE ──────────────────────────────────────────────────
+
+BACKTEST_STRATEGIES = {
+    "ma_crossover": "Hold while the short MA is above the long MA (golden cross in, death cross out)",
+    "rsi": "Buy when RSI falls below the low level, sell when it rises above the high level",
+    "macd": "Hold while the MACD line is above its signal line",
+    "bollinger": "Buy when price closes below the lower Bollinger Band, sell when it returns to the middle band",
+    "buy_and_hold": "Buy on day one and never sell (the benchmark)",
+}
+
+
+def _stateful_signal(entry_cond, exit_cond):
+    """Turns 'enter when X, exit when Y' rules into a 0/1 holding series."""
+    state = 0
+    out = []
+    for enter, leave in zip(entry_cond, exit_cond):
+        if enter is None:                 # indicator not ready yet
+            out.append(np.nan)
+            continue
+        if state == 0 and enter:
+            state = 1
+        elif state == 1 and leave:
+            state = 0
+        out.append(state)
+    return out
+
+
+def build_signal(close, strategy, p):
+    """Returns a Series of 1 (in the market) / 0 (out) / NaN (indicator warming up)."""
+    if strategy == "ma_crossover":
+        s, l = calculate_moving_averages(close, p["short_window"], p["long_window"])
+        sig = (s > l).astype(float)
+        sig[s.isna() | l.isna()] = np.nan
+        return sig
+
+    if strategy == "macd":
+        m, sg, _ = calculate_macd(close)
+        sig = (m > sg).astype(float)
+        sig.iloc[:35] = np.nan            # let the EMAs settle first
+        return sig
+
+    if strategy == "rsi":
+        rsi = calculate_rsi(close)
+        ready = ~rsi.isna()
+        entry = [bool(v < p["rsi_low"]) if r else None for v, r in zip(rsi, ready)]
+        exit_ = [bool(v > p["rsi_high"]) if r else None for v, r in zip(rsi, ready)]
+        return pd.Series(_stateful_signal(entry, exit_), index=close.index)
+
+    if strategy == "bollinger":
+        pb, _ = calculate_bollinger_bands(close)
+        ready = ~pb.isna()
+        entry = [bool(v < 0) if r else None for v, r in zip(pb, ready)]
+        exit_ = [bool(v > 0.5) if r else None for v, r in zip(pb, ready)]
+        return pd.Series(_stateful_signal(entry, exit_), index=close.index)
+
+    # buy_and_hold
+    return pd.Series(1.0, index=close.index)
+
+
+def run_backtest(close, strategy, p):
+    sig = build_signal(close, strategy, p)
+    start = sig.first_valid_index()
+    if start is None:
+        raise ValueError("Not enough history to compute this strategy's indicators.")
+    sig = sig.loc[start:].fillna(0)
+    close = close.loc[start:]
     if len(close) < 30:
-        raise HTTPException(status_code=400, detail="Not enough data in the chosen window to backtest.")
+        raise ValueError("Not enough history after indicator warm-up. Try more years.")
 
+    # Signal is known at today's close -> position is held from the NEXT day's return
+    position = sig.shift(1).fillna(0)
     ret = close.pct_change().fillna(0)
-    # signal known at today's close -> position is held from tomorrow's return onward (no look-ahead)
-    held = pos.shift(1).fillna(0)
-    turnover = pos.diff().abs().fillna(pos.iloc[0])
-    strat_ret = held * ret - turnover * (cost_pct / 100)
+    turnover = position.diff().abs().fillna(0)
+    strat_ret = position * ret - turnover * (p["cost_pct"] / 100)
 
-    equity = capital * (1 + strat_ret).cumprod()
-    bh_equity = capital * close / close.iloc[0]
+    equity = (1 + strat_ret).cumprod() * 100
+    bench = (1 + ret).cumprod() * 100
 
-    # Trade list (entries/exits at the closing price of the signal day)
-    trades, entry_date, entry_price = [], None, None
-    prev = 0
-    for date, p, c in zip(close.index, pos.values, close.values):
-        if p == 1 and prev == 0:
-            entry_date, entry_price = date, float(c)
-        elif p == 0 and prev == 1 and entry_date is not None:
+    # ── trades ──
+    changes = sig.diff().fillna(sig.iloc[0])
+    trades, entry = [], None
+    for date, ch in changes.items():
+        if ch > 0:
+            entry = (date, float(close.loc[date]))
+        elif ch < 0 and entry is not None:
+            px = float(close.loc[date])
             trades.append({
-                "entry_date": entry_date.strftime("%Y-%m-%d"), "entry_price": safe_round(entry_price),
-                "exit_date": date.strftime("%Y-%m-%d"), "exit_price": safe_round(c),
-                "return_pct": safe_round((float(c) / entry_price - 1) * 100 - 2 * cost_pct),
-                "open": False,
+                "entry_date": entry[0].strftime("%Y-%m-%d"), "entry_price": round(entry[1], 2),
+                "exit_date": date.strftime("%Y-%m-%d"), "exit_price": round(px, 2),
+                "return_pct": round((px / entry[1] - 1) * 100, 2), "open": False,
             })
-            entry_date = None
-        prev = int(p)
-    if entry_date is not None:   # still holding at the end
-        c = float(close.iloc[-1])
+            entry = None
+    if entry is not None:
+        px = float(close.iloc[-1])
         trades.append({
-            "entry_date": entry_date.strftime("%Y-%m-%d"), "entry_price": safe_round(entry_price),
-            "exit_date": close.index[-1].strftime("%Y-%m-%d"), "exit_price": safe_round(c),
-            "return_pct": safe_round((c / entry_price - 1) * 100 - cost_pct),
-            "open": True,
+            "entry_date": entry[0].strftime("%Y-%m-%d"), "entry_price": round(entry[1], 2),
+            "exit_date": close.index[-1].strftime("%Y-%m-%d"), "exit_price": round(px, 2),
+            "return_pct": round((px / entry[1] - 1) * 100, 2), "open": True,
         })
 
     closed = [t for t in trades if not t["open"]]
-    wins = [t for t in closed if t["return_pct"] is not None and t["return_pct"] > 0]
-    metrics = _metrics_from_returns(strat_ret, equity, capital, close.index)
-    metrics.update({
+    wins = [t for t in closed if t["return_pct"] > 0]
+
+    def summarize(eq, rets):
+        years = max(len(eq) / 252, 1 / 252)
+        total = eq.iloc[-1] / 100 - 1
+        cagr = (eq.iloc[-1] / 100) ** (1 / years) - 1
+        dd = (eq / eq.cummax() - 1).min()
+        vol = rets.std() * np.sqrt(252)
+        sharpe = (rets.mean() * 252) / vol if vol and not pd.isna(vol) and vol > 0 else None
+        return {
+            "total_return_pct": safe_round(total * 100),
+            "cagr_pct": safe_round(cagr * 100),
+            "max_drawdown_pct": safe_round(dd * 100),
+            "annual_volatility_pct": safe_round(vol * 100),
+            "sharpe_ratio": safe_round(sharpe),
+        }
+
+    strategy_stats = summarize(equity, strat_ret)
+    strategy_stats.update({
         "num_trades": len(trades),
         "win_rate_pct": safe_round(len(wins) / len(closed) * 100) if closed else None,
-        "time_in_market_pct": safe_round(float(held.mean()) * 100),
+        "time_in_market_pct": safe_round(float(position.mean()) * 100),
     })
-    bh_metrics = _metrics_from_returns(close.pct_change().fillna(0), bh_equity, capital, close.index)
 
-    curve = [{
+    rows = [{
         "date": d.strftime("%Y-%m-%d"),
-        "strategy": safe_round(e),
-        "buy_and_hold": safe_round(b),
-        "close": safe_round(c),
-        "in_position": int(p),
-    } for d, e, b, c, p in zip(close.index, equity.values, bh_equity.values, close.values, held.values)]
+        "close": safe_round(close.loc[d]),
+        "strategy_equity": safe_round(equity.loc[d]),
+        "buy_hold_equity": safe_round(bench.loc[d]),
+        "in_market": int(position.loc[d]),
+    } for d in close.index]
 
-    return {"metrics": metrics, "buy_and_hold_metrics": bh_metrics, "trades": trades, "equity_curve": curve}
+    return {
+        "strategy": strategy,
+        "description": BACKTEST_STRATEGIES[strategy],
+        "period": {"start": close.index[0].strftime("%Y-%m-%d"),
+                   "end": close.index[-1].strftime("%Y-%m-%d"), "trading_days": len(close)},
+        "currently_in_market": bool(sig.iloc[-1] == 1),
+        "strategy_stats": strategy_stats,
+        "buy_hold_stats": summarize(bench, ret),
+        "trades": trades,
+        "data": rows,
+        "assumptions": (f"Long-only, one share class, signals act at the close and earn returns from the "
+                        f"next day, {p['cost_pct']}% cost per trade, no tax/slippage. Educational only — "
+                        f"past performance does not predict future returns."),
+    }
 
 
-def _load_backtest_history(ticker):
-    hist = yf.Ticker(ticker).history(period="8y", auto_adjust=True)   # extra years so slow indicators have warm-up data
-    if hist.empty:
-        raise HTTPException(status_code=404, detail=f"No data found for {ticker}.")
-    return hist
+@app.get("/backtest/strategies")
+def list_strategies():
+    """Which strategies the backtester supports (for building a dropdown)."""
+    return {"strategies": [{"id": k, "description": v} for k, v in BACKTEST_STRATEGIES.items()]}
 
 
 @app.get("/backtest/{symbol}")
-def backtest(
-    symbol: str,
-    strategy: str = "ma_crossover",
-    months: int = 36,          # window to test over: 6 .. 60 months
-    fast: int = 50,            # MA crossover: fast window
-    slow: int = 200,           # MA crossover: slow window
-    rsi_period: int = 14,
-    rsi_buy: float = 30,
-    rsi_sell: float = 70,
-    cost_pct: float = 0.1,     # transaction cost per trade side, in %
-    capital: float = 100000,   # starting capital in INR
-):
+def backtest(symbol: str,
+             strategy: str = "ma_crossover",
+             years: int = 3,
+             short_window: int = 50,
+             long_window: int = 200,
+             rsi_low: int = 30,
+             rsi_high: int = 70,
+             cost_pct: float = 0.1):
     """
-    Long-only backtest of ONE strategy vs buy-and-hold.
-    Strategies: buy_and_hold, ma_crossover, rsi_mean_reversion, macd_crossover, bollinger_reversion
-    Example: /backtest/RELIANCE?strategy=rsi_mean_reversion&months=36
+    Backtest one strategy on one NSE stock.
+    Example: /backtest/RELIANCE?strategy=rsi&years=3&rsi_low=30&rsi_high=70
+    strategy = ma_crossover | rsi | macd | bollinger | buy_and_hold
     """
-    if strategy not in STRATEGIES:
-        raise HTTPException(status_code=400, detail=f"Unknown strategy. Choose from: {list(STRATEGIES)}")
-    months = min(max(months, 6), 60)
-    if fast >= slow:
-        raise HTTPException(status_code=400, detail="'fast' must be smaller than 'slow'.")
-    ticker = to_ticker(symbol)
+    if strategy not in BACKTEST_STRATEGIES:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown strategy. Choose one of: {', '.join(BACKTEST_STRATEGIES)}")
+    symbol = symbol.upper().strip()
+    ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
+    years = min(max(years, 1), 5)
+    params = {
+        "short_window": min(max(short_window, 2), 100),
+        "long_window": min(max(long_window, 5), 250),
+        "rsi_low": min(max(rsi_low, 5), 49),
+        "rsi_high": min(max(rsi_high, 51), 95),
+        "cost_pct": min(max(cost_pct, 0.0), 2.0),
+    }
+    if params["short_window"] >= params["long_window"]:
+        raise HTTPException(status_code=400, detail="short_window must be smaller than long_window.")
+
     try:
-        hist = _load_backtest_history(ticker)
-        result = _run_backtest(hist, strategy, months, fast, slow, rsi_period, rsi_buy, rsi_sell, cost_pct, capital)
-        return {
-            "symbol": ticker, "strategy": strategy, "description": STRATEGIES[strategy],
-            "months": months, "starting_capital": capital, "cost_pct_per_side": cost_pct,
-            "assumptions": "Long-only, one position at a time, trades at the closing price of the signal day, "
-                           "no look-ahead bias. Past performance does not predict future results. Educational use only.",
-            **result,
-        }
+        hist = yf.Ticker(ticker).history(period=f"{years}y", auto_adjust=True)
+        if hist.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}.")
+        result = run_backtest(hist["Close"].dropna(), strategy, params)
+        result["symbol"] = ticker
+        return result
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Backtest error for {ticker}: {str(e)}")
-
-
-@app.get("/backtest-all/{symbol}")
-def backtest_all(symbol: str, months: int = 36, cost_pct: float = 0.1, capital: float = 100000):
-    """Runs every strategy with default settings: leaderboard table + one combined equity-curve chart."""
-    months = min(max(months, 6), 60)
-    ticker = to_ticker(symbol)
-    try:
-        hist = _load_backtest_history(ticker)
-        leaderboard, curves = [], {}
-        for strat in STRATEGIES:
-            r = _run_backtest(hist, strat, months, 50, 200, 14, 30, 70, cost_pct, capital)
-            leaderboard.append({"strategy": strat, **r["metrics"]})
-            curves[strat] = {row["date"]: row["strategy"] for row in r["equity_curve"]}
-        leaderboard.sort(key=lambda x: (x["total_return_pct"] is None, -(x["total_return_pct"] or 0)))
-        all_dates = sorted(set().union(*[set(c) for c in curves.values()]))
-        rows = [{"date": d, **{k: curves[k].get(d) for k in curves}} for d in all_dates]
-        return {"symbol": ticker, "months": months, "starting_capital": capital,
-                "leaderboard": leaderboard, "equity_curves": rows}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Backtest error for {ticker}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error backtesting {ticker}: {str(e)}")
